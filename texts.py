@@ -160,26 +160,145 @@ SETTING_FREQ = "📊 Частота напоминаний"
 SETTING_TZ = "🌍 Часовой пояс"
 
 
-# Mood options after meal
-MOOD_HUNGRY_F = "🍽 Голодна — ела по голоду"
-MOOD_HUNGRY_M = "🍽 Голоден — ел по голоду"
-MOOD_HUNGRY_N = "🍽 По голоду"
-MOOD_CALM = "😌 Спокойно, без сильного голода"
-MOOD_TIRED_F = "😣 Устала / вымотана"
-MOOD_TIRED_M = "😣 Устал / вымотан"
-MOOD_TIRED_N = "😣 Усталость / вымотанность"
-MOOD_ANXIOUS = "😰 Тревожно / на нервах"
-MOOD_BORED = "🥱 Скучно / на автомате"
-MOOD_CELEBRATION = "🎉 За компанию / праздник"
+# ──────────────────────────────────────────────
+# Meal triggers (Q1 — why did you eat?)
+# ──────────────────────────────────────────────
+# Categories:
+#   hunger    — real physical hunger
+#   company   — social eating, parties, with people
+#   craving   — "just wanted it", no real emotion
+#   tired     — eating from tiredness/exhaustion
+#   anxious   — eating from anxiety/stress
+#   bored     — eating from boredom/auto-pilot
+
+TRIGGER_HUNGER = "hunger"
+TRIGGER_COMPANY = "company"
+TRIGGER_CRAVING = "craving"
+TRIGGER_TIRED = "tired"
+TRIGGER_ANXIOUS = "anxious"
+TRIGGER_BORED = "bored"
+
+TRIGGER_ORDER = [
+    TRIGGER_HUNGER, TRIGGER_COMPANY, TRIGGER_CRAVING,
+    TRIGGER_TIRED, TRIGGER_ANXIOUS, TRIGGER_BORED,
+]
+
+EMOTIONAL_TRIGGERS = {TRIGGER_TIRED, TRIGGER_ANXIOUS, TRIGGER_BORED}
+
+TRIGGER_LABELS = {
+    TRIGGER_HUNGER: {
+        "female": "🍽 Была голодна",
+        "male": "🍽 Был голоден",
+        "neutral": "🍽 По голоду",
+    },
+    TRIGGER_COMPANY: {
+        "female": "🎉 Покушала за компанию / Был праздник",
+        "male": "🎉 Покушал за компанию / Был праздник",
+        "neutral": "🎉 За компанию / праздник",
+    },
+    TRIGGER_CRAVING: {
+        "female": "😋 Просто захотелось / вкусняшки",
+        "male": "😋 Просто захотелось / вкусняшки",
+        "neutral": "😋 Просто захотелось / вкусняшки",
+    },
+    TRIGGER_TIRED: {
+        "female": "😣 Была уставшей",
+        "male": "😣 Был уставшим",
+        "neutral": "😣 Усталость",
+    },
+    TRIGGER_ANXIOUS: {
+        "female": "😰 Чувствовала тревогу",
+        "male": "😰 Чувствовал тревогу",
+        "neutral": "😰 Тревога",
+    },
+    TRIGGER_BORED: {
+        "female": "🥱 Чувствовала скуку",
+        "male": "🥱 Чувствовал скуку",
+        "neutral": "🥱 Скука",
+    },
+}
 
 
-def mood_options(gender: str | None) -> list[str]:
-    """Return mood button labels with gender-aware forms."""
-    if gender == "female":
-        return [MOOD_HUNGRY_F, MOOD_CALM, MOOD_TIRED_F, MOOD_ANXIOUS, MOOD_BORED, MOOD_CELEBRATION]
-    if gender == "male":
-        return [MOOD_HUNGRY_M, MOOD_CALM, MOOD_TIRED_M, MOOD_ANXIOUS, MOOD_BORED, MOOD_CELEBRATION]
-    return [MOOD_HUNGRY_N, MOOD_CALM, MOOD_TIRED_N, MOOD_ANXIOUS, MOOD_BORED, MOOD_CELEBRATION]
+def trigger_options(gender: str | None) -> list[str]:
+    """Return button labels for the meal trigger question (Q1)."""
+    g = gender if gender in ("female", "male") else "neutral"
+    return [TRIGGER_LABELS[cat][g] for cat in TRIGGER_ORDER]
+
+
+def trigger_by_label(text: str) -> str | None:
+    """Resolve a button label (any gender variant) back to canonical key."""
+    for cat, variants in TRIGGER_LABELS.items():
+        if text in variants.values():
+            return cat
+    return None
+
+
+# ──────────────────────────────────────────────
+# After-meal state (Q2 — only for emotional triggers)
+# ──────────────────────────────────────────────
+
+AFTER_BETTER = "better"
+AFTER_HEAVY = "heavy"
+AFTER_NO_HELP = "no_help"
+AFTER_NEUTRAL = "neutral"
+
+AFTER_BETTER_LABEL = "😌 Стало легче"
+AFTER_HEAVY_LABEL = "😣 Тяжесть, перебор"
+AFTER_NEUTRAL_LABEL = "🤔 Нейтрально"
+
+
+def _no_help_label(trigger: str, gender: str | None) -> str:
+    """Trigger-specific 'didn't help' label."""
+    g = gender if gender in ("female", "male") else "neutral"
+    if trigger == TRIGGER_TIRED:
+        if g == "female":
+            return "😞 Не помогло, всё равно устала"
+        if g == "male":
+            return "😞 Не помогло, всё равно устал"
+        return "😞 Не помогло, усталость осталась"
+    if trigger == TRIGGER_ANXIOUS:
+        return "😞 Не помогло, всё равно тревожно"
+    if trigger == TRIGGER_BORED:
+        return "😞 Не помогло, всё равно скучно"
+    return "😞 Не помогло"
+
+
+def after_state_options(trigger: str, gender: str | None) -> list[tuple[str, str]]:
+    """
+    Return list of (canonical_key, label) for Q2.
+    The label depends on trigger + gender; canonical key is constant.
+    """
+    return [
+        (AFTER_BETTER, AFTER_BETTER_LABEL),
+        (AFTER_HEAVY, AFTER_HEAVY_LABEL),
+        (AFTER_NO_HELP, _no_help_label(trigger, gender)),
+        (AFTER_NEUTRAL, AFTER_NEUTRAL_LABEL),
+    ]
+
+
+def after_state_by_label(text: str, trigger: str, gender: str | None) -> str | None:
+    for key, label in after_state_options(trigger, gender):
+        if text == label:
+            return key
+    return None
+
+
+# Human-readable name of a trigger for GPT context formatting.
+TRIGGER_HUMAN = {
+    TRIGGER_HUNGER: "по голоду",
+    TRIGGER_COMPANY: "за компанию / праздник",
+    TRIGGER_CRAVING: "просто захотелось",
+    TRIGGER_TIRED: "от усталости",
+    TRIGGER_ANXIOUS: "от тревоги",
+    TRIGGER_BORED: "от скуки",
+}
+
+AFTER_HUMAN = {
+    AFTER_BETTER: "после еды стало легче",
+    AFTER_HEAVY: "после еды тяжесть, перебор",
+    AFTER_NO_HELP: "после еды состояние не изменилось — не помогло",
+    AFTER_NEUTRAL: "после еды нейтрально",
+}
 
 
 # ──────────────────────────────────────────────
@@ -197,7 +316,7 @@ STEP0_GREETING = (
 )
 STEP0_BUTTON = "Поехали"
 
-STEP1_ASK_NAME = "Как мне тебя называть?"
+STEP1_ASK_NAME = "Как тебя зовут?"
 
 
 def step1_name_ack(name: str) -> str:
@@ -262,7 +381,7 @@ STEP3_PARAMS_INTRO = (
     "не хочется говорить, просто пропусти."
 )
 
-STEP3_ASK_GENDER = "Кто ты?"
+STEP3_ASK_GENDER = "Какой у тебя пол?"
 GENDER_FEMALE_LABEL = "Женщина"
 GENDER_MALE_LABEL = "Мужчина"
 BTN_SKIP = "Пропустить"
@@ -497,7 +616,11 @@ MEAL_LOG_ASK_FOOD = (
     "или прислать фото, я посмотрю, что там."
 )
 
-MEAL_LOG_ASK_MOOD = "Поняла. А как ты сейчас себя чувствуешь?"
+MEAL_LOG_ASK_TRIGGER = "Поняла. А что в моменте было — почему потянуло к еде?"
+MEAL_LOG_ASK_AFTER_STATE = "А сейчас, после еды, как?"
+
+# Kept for back-compat with any reference in docs/onboarding-copy.md
+MEAL_LOG_ASK_MOOD = MEAL_LOG_ASK_TRIGGER
 
 
 def photo_confirm(text: str) -> str:
