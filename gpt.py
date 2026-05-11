@@ -85,13 +85,24 @@ def gender_form(user) -> str:
 def _format_meals(meals) -> str:
     if not meals:
         return "Записей нет."
+    # Lazy import to keep this module self-contained.
+    from texts import TRIGGER_HUMAN, AFTER_HUMAN
     lines = []
     for m in meals:
         day = m["created_at"].strftime("%d.%m %H:%M")
-        mood = m["mood"] or "—"
         meal = m["meal_text"] or "—"
         slot = f" [{m.get('meal_slot')}]" if m.get("meal_slot") else ""
-        lines.append(f"[{day}]{slot} состояние: {mood} | еда: {meal}")
+        # Prefer canonical trigger/after_state if present, fall back to legacy `mood`.
+        trigger_key = m.get("trigger")
+        after_key = m.get("after_state")
+        if trigger_key:
+            bits = [f"триггер: {TRIGGER_HUMAN.get(trigger_key, trigger_key)}"]
+            if after_key:
+                bits.append(f"после: {AFTER_HUMAN.get(after_key, after_key)}")
+            state_str = " | ".join(bits)
+        else:
+            state_str = f"состояние: {m['mood'] or '—'}"
+        lines.append(f"[{day}]{slot} {state_str} | еда: {meal}")
     return "\n".join(lines)
 
 
