@@ -31,11 +31,13 @@ async def init_db(database_url: str):
             CREATE TABLE IF NOT EXISTS meal_logs (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT REFERENCES users(id),
-                mood TEXT,
+                mood TEXT,                -- legacy: free-form label seen by user
                 meal_text TEXT,
                 is_hungry BOOLEAN,
                 gpt_response TEXT,
                 meal_slot TEXT,           -- breakfast | lunch | dinner | snack | unknown
+                trigger TEXT,             -- canonical: hunger|company|craving|tired|anxious|bored
+                after_state TEXT,         -- canonical: better|heavy|no_help|neutral  (NULL if not asked)
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
 
@@ -121,6 +123,8 @@ async def init_db(database_url: str):
             ALTER TABLE users ADD COLUMN IF NOT EXISTS sos_pending BOOLEAN DEFAULT FALSE;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS paused_until TIMESTAMPTZ;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
+            ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS trigger TEXT;
+            ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS after_state TEXT;
         """)
 
 
@@ -274,19 +278,25 @@ async def save_meal_log(
     gpt_response: str | None,
     meal_slot: str | None = None,
     created_at: datetime | None = None,
+    trigger: str | None = None,
+    after_state: str | None = None,
 ):
     """If `created_at` is provided, use it (for day-recap parsing in 1x/day mode)."""
     if created_at is None:
         await pool.execute(
-            """INSERT INTO meal_logs (user_id, mood, meal_text, is_hungry, gpt_response, meal_slot)
-               VALUES ($1, $2, $3, $4, $5, $6)""",
-            user_id, mood, meal_text, is_hungry, gpt_response, meal_slot,
+            """INSERT INTO meal_logs (user_id, mood, meal_text, is_hungry, gpt_response,
+                                      meal_slot, trigger, after_state)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+            user_id, mood, meal_text, is_hungry, gpt_response,
+            meal_slot, trigger, after_state,
         )
     else:
         await pool.execute(
-            """INSERT INTO meal_logs (user_id, mood, meal_text, is_hungry, gpt_response, meal_slot, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-            user_id, mood, meal_text, is_hungry, gpt_response, meal_slot, created_at,
+            """INSERT INTO meal_logs (user_id, mood, meal_text, is_hungry, gpt_response,
+                                      meal_slot, trigger, after_state, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+            user_id, mood, meal_text, is_hungry, gpt_response,
+            meal_slot, trigger, after_state, created_at,
         )
 
 
