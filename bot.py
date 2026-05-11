@@ -1031,36 +1031,33 @@ async def sos_chat(message: Message, state: FSMContext):
 # ──────────────────────────────────────────────
 
 async def send_meal_reminder(user_id: int, slot: str):
-    """Simple nudge after a meal. No GPT call."""
+    """Slot-specific nudge sent +30 min after each meal time. No GPT call."""
     try:
         user = await db.get_user(user_id)
         if not user or not user["onboarding_done"]:
             return
-        slot_label = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин"}.get(slot, "приём пищи")
-        await bot.send_message(
-            user_id,
-            f"Лёгкое напоминание: если уже поела ({slot_label}) — запиши, пока свежо в памяти 🍃",
-        )
+        text = T.MEAL_REMINDER_TEXTS.get(slot)
+        if not text:
+            return
+        await bot.send_message(user_id, text)
     except Exception as e:
         logger.error(f"send_meal_reminder error for {user_id}: {e}")
 
 
 async def send_evening_reflection(user_id: int):
-    """3x / 2x evening reflection — GPT-generated opener."""
+    """3x / 2x evening reflection — fixed (non-GPT) text. Optional for the user.
+    Sets evening_pending = TRUE so any text reply will be routed through
+    gpt.evening_reflection_reply() in the fallback handler."""
     try:
         user = await db.get_user(user_id)
         if not user or not user["onboarding_done"]:
             return
         if user["reminder_frequency"] == T.FREQ_EVENING_ONLY:
             return  # different scheduler job handles 1x mode
-        tz = user["timezone"] or "Europe/Moscow"
-        today = await db.get_today_meals(user_id, tz)
-        week = await db.get_week_meals(user_id)
-        week_sos = await db.get_week_sos(user_id)
-        response = await gpt.evening_reflection_start(user, today, week, week_sos)
-        await db.save_evening_log(user_id, None, response)
+        text = T.EVENING_REFLECTION_PROMPT
+        await db.save_evening_log(user_id, None, text)
         await db.set_evening_pending(user_id, True)
-        await bot.send_message(user_id, response)
+        await bot.send_message(user_id, text)
         # Energy check for energy-goal users
         if user["goal"] == T.GOAL_ENERGY:
             await asyncio.sleep(1)
@@ -1385,9 +1382,11 @@ def schedule_user_jobs(user):
     )
 
     if freq == T.FREQ_EACH_MEAL:
+        # Three meal reminders (breakfast / lunch / dinner) at +30 min each.
         for t, slot, prefix in [
             (user["breakfast_time"], "breakfast", "rmb"),
             (user["lunch_time"], "lunch", "rml"),
+            (user["dinner_time"], "dinner", "rmd"),
         ]:
             if t:
                 h, m = _add_minutes(t, 30)
@@ -1397,14 +1396,19 @@ def schedule_user_jobs(user):
                     args=[user_id, slot], id=f"{prefix}_{user_id}",
                     replace_existing=True,
                 )
+        # Optional evening reflection 30 minutes after the dinner reminder
+        # (= dinner_time + 60). Guaranteed 30-min gap so the two messages
+        # never collide.
         if user["dinner_time"]:
-            h, m = _add_minutes(user["dinner_time"], 30)
+            h, m = _add_minutes(user["dinner_time"], 60)
             scheduler.add_job(
                 send_evening_reflection,
                 CronTrigger(hour=h, minute=m, timezone=tz),
                 args=[user_id], id=f"evening_{user_id}", replace_existing=True,
             )
     elif freq == T.FREQ_MORNING_EVENING:
+        # Two meal reminders (breakfast + dinner) at +30 each, then reflection
+        # 30 min after dinner reminder.
         if user["breakfast_time"]:
             h, m = _add_minutes(user["breakfast_time"], 30)
             scheduler.add_job(
@@ -1415,6 +1419,13 @@ def schedule_user_jobs(user):
             )
         if user["dinner_time"]:
             h, m = _add_minutes(user["dinner_time"], 30)
+            scheduler.add_job(
+                send_meal_reminder,
+                CronTrigger(hour=h, minute=m, timezone=tz),
+                args=[user_id, "dinner"], id=f"rmd_{user_id}",
+                replace_existing=True,
+            )
+            h, m = _add_minutes(user["dinner_time"], 60)
             scheduler.add_job(
                 send_evening_reflection,
                 CronTrigger(hour=h, minute=m, timezone=tz),
