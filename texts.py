@@ -197,7 +197,7 @@ STEP0_GREETING = (
 )
 STEP0_BUTTON = "Поехали"
 
-STEP1_ASK_NAME = "Как мне тебя называть?"
+STEP1_ASK_NAME = "Как тебя зовут?"
 
 
 def step1_name_ack(name: str) -> str:
@@ -262,7 +262,7 @@ STEP3_PARAMS_INTRO = (
     "не хочется говорить, просто пропусти."
 )
 
-STEP3_ASK_GENDER = "Кто ты?"
+STEP3_ASK_GENDER = "Какой у тебя пол?"
 GENDER_FEMALE_LABEL = "Женщина"
 GENDER_MALE_LABEL = "Мужчина"
 BTN_SKIP = "Пропустить"
