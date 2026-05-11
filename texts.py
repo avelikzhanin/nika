@@ -666,6 +666,32 @@ LONG_SILENCE_RETURN = (
 )
 
 
+# ──────────────────────────────────────────────
+# Scheduled message texts (reminders + reflection)
+# ──────────────────────────────────────────────
+
+MEAL_REMINDER_BREAKFAST = (
+    "Завтрак уже был? Если да — запиши парой слов, пока свежо 🍃"
+)
+MEAL_REMINDER_LUNCH = (
+    "А обед? Если уже было — пара минут на запись, и всё."
+)
+MEAL_REMINDER_DINNER = (
+    "День к закату. Если ужин уже был — запиши, пока вечер не съел память 🌙"
+)
+
+MEAL_REMINDER_TEXTS = {
+    "breakfast": MEAL_REMINDER_BREAKFAST,
+    "lunch": MEAL_REMINDER_LUNCH,
+    "dinner": MEAL_REMINDER_DINNER,
+}
+
+EVENING_REFLECTION_PROMPT = (
+    "Вечер. Если есть, что хочется отметить про сегодня с едой — "
+    "напиши пару фраз. Что-то конкретное или просто общее ощущение от дня.\n\n"
+    "Это не задание — пиши, если хочется. Я рядом 🤍"
+)
+
 ENERGY_CHECK_PROMPT = "Как сегодня с энергией?"
 ENERGY_LABELS = {
     1: "1 😩",
