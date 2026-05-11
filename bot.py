@@ -86,7 +86,8 @@ class Onboarding(StatesGroup):
 class MealLog(StatesGroup):
     food = State()
     photo_confirm = State()
-    mood = State()
+    trigger = State()       # Q1: why did you eat?
+    after_state = State()   # Q2: how do you feel now? (emotional triggers only)
 
 
 class SOSDialog(StatesGroup):
@@ -217,9 +218,17 @@ def kb_bmi_review() -> InlineKeyboardMarkup:
     ])
 
 
-def kb_moods(gender: str | None) -> ReplyKeyboardMarkup:
-    options = T.mood_options(gender)
+def kb_triggers(gender: str | None) -> ReplyKeyboardMarkup:
+    """Q1 — six possible meal triggers, gender-aware labels."""
+    options = T.trigger_options(gender)
     rows = [[KeyboardButton(text=o)] for o in options]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def kb_after_state(trigger: str, gender: str | None) -> ReplyKeyboardMarkup:
+    """Q2 — four after-state options. 'didn't help' label depends on trigger+gender."""
+    options = T.after_state_options(trigger, gender)
+    rows = [[KeyboardButton(text=label)] for _, label in options]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
@@ -719,9 +728,9 @@ async def cb_photo_ok(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
     await cq.message.edit_reply_markup(reply_markup=None)
     user = await db.get_user(cq.from_user.id)
-    await cq.message.answer(T.MEAL_LOG_ASK_MOOD,
-                            reply_markup=kb_moods(user["gender"]))
-    await state.set_state(MealLog.mood)
+    await cq.message.answer(T.MEAL_LOG_ASK_TRIGGER,
+                            reply_markup=kb_triggers(user["gender"]))
+    await state.set_state(MealLog.trigger)
 
 
 @router.callback_query(MealLog.photo_confirm, F.data == "photo_fix")
@@ -740,20 +749,24 @@ async def meal_food_text(message: Message, state: FSMContext):
         return
     await state.update_data(food_text=food_text, from_photo=False)
     user = await db.get_user(message.from_user.id)
-    await message.answer(T.MEAL_LOG_ASK_MOOD, reply_markup=kb_moods(user["gender"]))
-    await state.set_state(MealLog.mood)
+    await message.answer(T.MEAL_LOG_ASK_TRIGGER, reply_markup=kb_triggers(user["gender"]))
+    await state.set_state(MealLog.trigger)
 
 
-@router.message(MealLog.mood)
-async def meal_mood(message: Message, state: FSMContext):
-    mood = (message.text or "").strip()
+@router.message(MealLog.trigger)
+async def meal_trigger(message: Message, state: FSMContext):
+    """Q1 handler: resolve trigger, then either finalize or ask Q2."""
+    text = (message.text or "").strip()
+    user = await db.get_user(message.from_user.id)
+    trigger = T.trigger_by_label(text)
+    if trigger is None:
+        await message.answer("Выбери одну из кнопок 👇", reply_markup=kb_triggers(user["gender"]))
+        return
+
+    # Safety classifier on the trigger label + food text
     data = await state.get_data()
     food_text = data.get("food_text", "")
-
-    user = await db.get_user(message.from_user.id)
-
-    # Safety classifier on the combined text
-    red_flag = await gpt.safety_check(f"{mood}\n{food_text}")
+    red_flag = await gpt.safety_check(f"{text}\n{food_text}")
     if red_flag:
         await message.answer(
             T.safety_red_flag_message(user["name"] or ""),
@@ -762,18 +775,83 @@ async def meal_mood(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    today = await db.get_today_meals(message.from_user.id, user["timezone"] or "Europe/Moscow")
-    week = await db.get_week_meals(message.from_user.id)
-    combined = f"Состояние: {mood}\nЕда: {food_text}"
+    # Emotional trigger → ask Q2
+    if trigger in T.EMOTIONAL_TRIGGERS:
+        await state.update_data(trigger=trigger, trigger_label=text)
+        await message.answer(
+            T.MEAL_LOG_ASK_AFTER_STATE,
+            reply_markup=kb_after_state(trigger, user["gender"]),
+        )
+        await state.set_state(MealLog.after_state)
+        return
+
+    # Non-emotional trigger → finalize immediately
+    await _finalize_meal_log(
+        message, state, user,
+        trigger=trigger, trigger_label=text,
+        food_text=food_text, after_state=None,
+    )
+
+
+@router.message(MealLog.after_state)
+async def meal_after_state(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    trigger: str = data.get("trigger") or T.TRIGGER_TIRED
+    user = await db.get_user(message.from_user.id)
+
+    after_state_key = T.after_state_by_label(text, trigger, user["gender"])
+    if after_state_key is None:
+        await message.answer(
+            "Выбери одну из кнопок 👇",
+            reply_markup=kb_after_state(trigger, user["gender"]),
+        )
+        return
+
+    food_text = data.get("food_text", "")
+    trigger_label = data.get("trigger_label", text)
+    await _finalize_meal_log(
+        message, state, user,
+        trigger=trigger, trigger_label=trigger_label,
+        food_text=food_text, after_state=after_state_key,
+    )
+
+
+async def _finalize_meal_log(
+    message: Message,
+    state: FSMContext,
+    user,
+    *,
+    trigger: str,
+    trigger_label: str,
+    food_text: str,
+    after_state: str | None,
+):
+    """Common finalization for meal logging — runs GPT, saves, returns to main menu."""
+    today = await db.get_today_meals(user["id"], user["timezone"] or "Europe/Moscow")
+    week = await db.get_week_meals(user["id"])
+
+    # Build the message that goes into MAIN_PROMPT
+    parts = [
+        f"Еда: {food_text}",
+        f"Триггер: {T.TRIGGER_HUMAN.get(trigger, trigger_label)} ({trigger_label})",
+    ]
+    if after_state:
+        parts.append(f"После еды: {T.AFTER_HUMAN.get(after_state, after_state)}")
+    combined = "\n".join(parts)
     response = await gpt.meal_checkin_response(user, today, week, combined)
 
-    is_hungry = "голод" in mood.lower()
+    is_hungry = (trigger == T.TRIGGER_HUNGER)
     await db.save_meal_log(
-        user["id"], mood=mood, meal_text=food_text,
-        is_hungry=is_hungry, gpt_response=response,
+        user["id"],
+        mood=trigger_label,
+        meal_text=food_text,
+        is_hungry=is_hungry,
+        gpt_response=response,
+        trigger=trigger,
+        after_state=after_state,
     )
     await db.touch_last_active(user["id"])
-    # Fire-and-forget fact extraction
     asyncio.create_task(gpt.persist_facts(user["id"], combined))
 
     await message.answer(response, reply_markup=kb_main_menu())
