@@ -123,6 +123,7 @@ async def init_db(database_url: str):
             ALTER TABLE users ADD COLUMN IF NOT EXISTS sos_pending BOOLEAN DEFAULT FALSE;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS paused_until TIMESTAMPTZ;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
+            ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS meal_slot TEXT;
             ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS trigger TEXT;
             ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS after_state TEXT;
         """)
