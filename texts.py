@@ -283,6 +283,42 @@ def after_state_by_label(text: str, trigger: str, gender: str | None) -> str | N
     return None
 
 
+# ──────────────────────────────────────────────
+# Meal slot inference from free text
+# ──────────────────────────────────────────────
+# Used as priority 2 fallback: if a meal log wasn't started from a reminder
+# (so we don't know the slot from the flag), but the user mentions "на завтрак"
+# or "поужинала" in their text, we can extract the slot from that.
+# Priority order: explicit meal words first, "перекус" last — так фраза типа
+# "перекусила бутерброд на завтрак" корректно даст breakfast, не snack.
+
+_SLOT_KEYWORDS: list[tuple[str, list[str]]] = [
+    ("breakfast", ["завтрак", "позавтрак", "брекфаст", "брэкфаст"]),
+    ("lunch", ["обед", "пообедал", "ланч", "lunch"]),
+    ("dinner", ["ужин", "поужинал"]),
+    ("snack", ["перекус", "перекусил", "перекусон"]),
+]
+
+
+def infer_slot_from_text(text: str | None) -> str | None:
+    """Return slot key inferred from a Russian food description, or None.
+
+    Examples:
+      "На завтрак овсянка с бананом" → "breakfast"
+      "Поужинала пиццей"             → "dinner"
+      "Перекусила яблоком"           → "snack"
+      "Овсянка с бананом"            → None  (no slot word — caller falls back)
+    """
+    if not text:
+        return None
+    lower = text.lower()
+    for slot, keywords in _SLOT_KEYWORDS:
+        for kw in keywords:
+            if kw in lower:
+                return slot
+    return None
+
+
 # Human-readable name of a trigger for GPT context formatting.
 TRIGGER_HUMAN = {
     TRIGGER_HUNGER: "по голоду",
