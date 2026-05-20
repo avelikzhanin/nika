@@ -123,6 +123,8 @@ async def init_db(database_url: str):
             ALTER TABLE users ADD COLUMN IF NOT EXISTS sos_pending BOOLEAN DEFAULT FALSE;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS paused_until TIMESTAMPTZ;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS meal_reminder_pending TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS meal_reminder_pending_at TIMESTAMPTZ;
             ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS meal_slot TEXT;
             ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS trigger TEXT;
             ALTER TABLE meal_logs ADD COLUMN IF NOT EXISTS after_state TEXT;
@@ -160,6 +162,7 @@ async def update_user_field(user_id: int, field: str, value):
         "timezone", "evening_hour", "evening_minute",
         "onboarding_done", "evening_pending", "sos_pending",
         "paused_until", "last_active_at",
+        "meal_reminder_pending", "meal_reminder_pending_at",
     }
     if field not in allowed:
         raise ValueError(f"Field {field} is not allowed for update")
@@ -206,6 +209,25 @@ async def set_sos_pending(user_id: int, pending: bool):
     await pool.execute(
         "UPDATE users SET sos_pending = $1 WHERE id = $2", pending, user_id
     )
+
+
+async def set_meal_reminder_pending(user_id: int, slot: str | None):
+    """If slot given — mark this slot as 'awaiting open-text reply'.
+    If None — clear the flag. Timestamp is updated atomically."""
+    if slot is None:
+        await pool.execute(
+            """UPDATE users SET meal_reminder_pending = NULL,
+                                meal_reminder_pending_at = NULL
+               WHERE id = $1""",
+            user_id,
+        )
+    else:
+        await pool.execute(
+            """UPDATE users SET meal_reminder_pending = $1,
+                                meal_reminder_pending_at = NOW()
+               WHERE id = $2""",
+            slot, user_id,
+        )
 
 
 # ──────────────────────────────────────────────
