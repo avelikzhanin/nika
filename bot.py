@@ -702,6 +702,7 @@ async def cb_disclaimer_ok(cq: CallbackQuery, state: FSMContext):
 async def meal_start(message: Message, state: FSMContext):
     await state.clear()
     await db.set_evening_pending(message.from_user.id, False)
+    await db.set_meal_reminder_pending(message.from_user.id, None)
     await db.touch_last_active(message.from_user.id)
     await message.answer(T.MEAL_LOG_ASK_FOOD, reply_markup=ReplyKeyboardRemove())
     await state.set_state(MealLog.food)
@@ -843,12 +844,20 @@ async def _finalize_meal_log(
     response = await gpt.meal_checkin_response(user, today, week, combined)
 
     is_hungry = (trigger == T.TRIGGER_HUNGER)
+    # Slot resolution priority:
+    #   1. reminder_slot — set when the user replied to a meal reminder
+    #   2. infer from text keywords ("На завтрак ...", "Поужинала ...")
+    #   3. NULL — micro-insight detector will fall back to local-time heuristic
+    data_now = await state.get_data()
+    reminder_slot = data_now.get("reminder_slot")
+    inferred_slot = reminder_slot or T.infer_slot_from_text(food_text)
     await db.save_meal_log(
         user["id"],
         mood=trigger_label,
         meal_text=food_text,
         is_hungry=is_hungry,
         gpt_response=response,
+        meal_slot=inferred_slot,
         trigger=trigger,
         after_state=after_state,
     )
@@ -913,9 +922,12 @@ async def meal_chatting(message: Message, state: FSMContext):
     data = await state.get_data()
     user = await db.get_user(message.from_user.id)
 
-    # Stale state OR evening message was scheduled while user was idle —
+    # Stale state OR a scheduled message arrived while user was idle —
     # this text is no longer a meal-continuation, hand off to fallback.
-    if _is_meal_chat_stale(data) or (user and user["evening_pending"]):
+    pending_external = user and (
+        user["evening_pending"] or user["meal_reminder_pending"]
+    )
+    if _is_meal_chat_stale(data) or pending_external:
         await state.clear()
         await fallback(message, state)
         return
@@ -1031,7 +1043,10 @@ async def sos_chat(message: Message, state: FSMContext):
 # ──────────────────────────────────────────────
 
 async def send_meal_reminder(user_id: int, slot: str):
-    """Slot-specific nudge sent +30 min after each meal time. No GPT call."""
+    """Slot-specific nudge sent +30 min after each meal time. No GPT call.
+    Sets meal_reminder_pending so the user's next plain-text reply (within
+    MEAL_REMINDER_TTL) is treated as a food entry rather than ignored
+    by the fallback."""
     try:
         user = await db.get_user(user_id)
         if not user or not user["onboarding_done"]:
@@ -1040,6 +1055,7 @@ async def send_meal_reminder(user_id: int, slot: str):
         if not text:
             return
         await bot.send_message(user_id, text)
+        await db.set_meal_reminder_pending(user_id, slot)
     except Exception as e:
         logger.error(f"send_meal_reminder error for {user_id}: {e}")
 
@@ -1116,7 +1132,8 @@ async def check_micro_insight(user_id: int):
             return
         week = await db.get_week_meals(user_id)
         week_sos = await db.get_week_sos(user_id)
-        signal = _detect_local_signal(week, week_sos)
+        tz = user["timezone"] or "Europe/Moscow"
+        signal = _detect_local_signal(week, week_sos, tz)
         if not signal:
             return
         insight = await gpt.micro_insight(user, signal, week_meals=week)
@@ -1128,30 +1145,60 @@ async def check_micro_insight(user_id: int):
         logger.error(f"check_micro_insight error for {user_id}: {e}")
 
 
-def _detect_local_signal(week_meals, week_sos) -> str | None:
+def _detect_local_signal(
+    week_meals, week_sos, tz_name: str = "Europe/Moscow",
+) -> str | None:
     """Heuristic detection of patterns worth pinging about. Returns a short
-    Russian description of the signal, or None."""
+    Russian description of the signal, or None.
+
+    All time comparisons are in the user's local timezone — created_at is
+    UTC, we always convert before comparing hours. We also trust meal_slot
+    if it's set (filled by day-recap parser, or by reminder-reply flow).
+    """
     if len(week_meals) < 4:
         return None
 
-    # Breakfast skipping streak
+    tz = ZoneInfo(tz_name)
+
+    # Group meals by local date.
     by_day: dict = {}
     for m in week_meals:
-        d = m["created_at"].date()
-        by_day.setdefault(d, []).append(m)
-    no_breakfast_days = 0
-    for day_meals in by_day.values():
-        has_breakfast = any(
-            (m.get("meal_slot") == "breakfast") or
-            (m["created_at"].hour < 11) for m in day_meals
+        local = m["created_at"].astimezone(tz)
+        by_day.setdefault(local.date(), []).append(
+            {"meal": m, "local_hour": local.hour}
         )
-        if not has_breakfast:
-            no_breakfast_days += 1
-    if no_breakfast_days >= 3:
-        return f"пропуск завтрака — {no_breakfast_days} дней за неделю"
 
-    # Late dinners (after 22:00)
-    late = sum(1 for m in week_meals if m["created_at"].hour >= 22)
+    # "Skipped morning" — a day where the user's first logged meal in local
+    # time is after 14:00. Trust meal_slot if it explicitly marks the meal
+    # as breakfast/lunch/snack — those count as "morning food regardless of
+    # when the entry was made" (e.g. user logged at 12:00 saying "yogurt
+    # at 9").
+    skipped_morning_days = 0
+    for entries in by_day.values():
+        entries.sort(key=lambda e: e["local_hour"])
+        # If any meal in the day is tagged breakfast/lunch/snack → not a skip
+        has_morning_tag = any(
+            e["meal"].get("meal_slot") in ("breakfast", "lunch", "snack")
+            for e in entries
+        )
+        if has_morning_tag:
+            continue
+        # Otherwise look at the local hour of the earliest meal
+        if entries[0]["local_hour"] < 14:
+            continue
+        skipped_morning_days += 1
+
+    if skipped_morning_days >= 3:
+        return (
+            f"первый приём пищи за день — после 14:00 "
+            f"({skipped_morning_days} дней за неделю)"
+        )
+
+    # Late dinners (after 22:00 in local time)
+    late = sum(
+        1 for m in week_meals
+        if m["created_at"].astimezone(tz).hour >= 22
+    )
     if late >= 3:
         return f"поздние ужины (после 22:00) — {late} раз за неделю"
 
@@ -1468,6 +1515,10 @@ async def restore_schedules():
 
 LONG_SILENCE_THRESHOLD = timedelta(days=3)
 
+# How long after a meal reminder we still treat free-text replies as
+# "the user is logging that meal" rather than as unknown text.
+MEAL_REMINDER_TTL = timedelta(hours=4)
+
 
 @router.message()
 async def fallback(message: Message, state: FSMContext):
@@ -1490,6 +1541,32 @@ async def fallback(message: Message, state: FSMContext):
         )
         await db.touch_last_active(user["id"])
         return
+
+    # Open-text reply to a meal reminder (within TTL) → kick off meal flow
+    # with the proper slot pre-set. This makes reminders feel like "you can
+    # just type" rather than "you must press a button".
+    mrp_slot = user["meal_reminder_pending"]
+    mrp_at = user["meal_reminder_pending_at"]
+    if mrp_slot and mrp_at:
+        age = datetime.now(mrp_at.tzinfo) - mrp_at
+        if age < MEAL_REMINDER_TTL:
+            # Consume the flag and jump into the standard meal-log flow at
+            # the trigger question, with food_text and slot pre-filled.
+            await db.set_meal_reminder_pending(user["id"], None)
+            await db.touch_last_active(user["id"])
+            await state.update_data(
+                food_text=user_text,
+                from_photo=False,
+                reminder_slot=mrp_slot,
+            )
+            await message.answer(
+                T.MEAL_LOG_ASK_TRIGGER,
+                reply_markup=kb_triggers(user["gender"]),
+            )
+            await state.set_state(MealLog.trigger)
+            return
+        # Stale — clear it and continue normal fallback flow.
+        await db.set_meal_reminder_pending(user["id"], None)
 
     # Long-silence return
     last_active = user["last_active_at"]
