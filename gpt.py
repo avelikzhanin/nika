@@ -30,6 +30,7 @@ from prompts import (
     SOS_PROMPT,
     WEEKLY_REPORT_PROMPT,
     MICRO_INSIGHT_PROMPT,
+    MICRO_INSIGHT_DETECTOR_PROMPT,
     SAFETY_CLASSIFIER_PROMPT,
     FACT_EXTRACTOR_PROMPT,
     DAY_RECAP_PARSER_PROMPT,
@@ -379,6 +380,23 @@ async def meal_checkin_response(user, today_meals, week_meals, user_message: str
     )
 
 
+async def meal_continuation_response(
+    user, today_meals, week_meals, conversation: list[dict],
+) -> str:
+    """
+    Multi-turn continuation after the initial meal-checkin reply.
+    `conversation` follows OpenAI's role/content format and includes the
+    original meal description + Ника's first response + subsequent turns.
+    """
+    ctx = await _build_user_context(
+        user,
+        today_meals=today_meals,
+        week_meals=week_meals,
+        include_last_summary=True,
+    )
+    return await _ask_conversation(MAIN_PROMPT, ctx, conversation)
+
+
 # ──────────────────────────────────────────────
 # Evening reflection (3x / 2x modes)
 # ──────────────────────────────────────────────
@@ -504,6 +522,7 @@ def _parse_weekly_meta(raw: str) -> dict:
 # ──────────────────────────────────────────────
 
 async def micro_insight(user, signal_text: str, week_meals=None) -> str:
+    """Generate a micro-insight from a pre-detected signal (hardcoded fallback)."""
     ctx = await _build_user_context(
         user, week_meals=week_meals, include_last_summary=False,
     )
@@ -513,6 +532,59 @@ async def micro_insight(user, signal_text: str, week_meals=None) -> str:
         f"[СИГНАЛ] {signal_text}\n\nНапиши короткое наблюдение (1-2 предложения).",
         max_tokens=180,
     )
+
+
+async def detect_and_generate_micro_insight(
+    user,
+    current_week_meals,
+    previous_week_meals,
+    current_week_sos,
+    previous_week_sos,
+) -> str | None:
+    """Primary micro-insight path: hand GPT the full 2-week context split
+    into prev/current week, let it decide if there's a pattern AND write
+    the insight in one call.
+
+    Returns the insight text to send to the user, or None if GPT decided
+    there's no pattern worth surfacing today.
+    """
+    # Build the profile/facts context without week-data sections — we add
+    # those manually below in a split format.
+    base_ctx = await _build_user_context(
+        user,
+        include_facts=True,
+        include_last_summary=True,
+        include_recent_replies=False,  # not relevant for detection
+    )
+
+    split_data = (
+        "\n--- ПРЕДЫДУЩАЯ НЕДЕЛЯ (8-14 дней назад) ---\n"
+        f"Еда:\n{_format_meals(previous_week_meals)}\n"
+        f"{_format_sos(previous_week_sos)}\n"
+        "\n--- ТЕКУЩАЯ НЕДЕЛЯ (последние 7 дней) ---\n"
+        f"Еда:\n{_format_meals(current_week_meals)}\n"
+        f"{_format_sos(current_week_sos)}"
+    )
+
+    full_ctx = base_ctx + split_data
+
+    try:
+        result = await _ask_with_context(
+            MICRO_INSIGHT_DETECTOR_PROMPT,
+            full_ctx,
+            "Проанализируй данные. Если есть значимый паттерн — напиши "
+            "готовый инсайт. Если нет — верни `none`.",
+            max_tokens=200,
+            temperature=0.4,  # lower temp — more conservative about pattern claims
+        )
+        cleaned = (result or "").strip()
+        # Common ways the model might say "no pattern"
+        if not cleaned or cleaned.lower() in {"none", "none.", "нет", "нет.", "-"}:
+            return None
+        return cleaned
+    except Exception as e:
+        logger.error(f"detect_and_generate_micro_insight error: {e}")
+        return None
 
 
 # ──────────────────────────────────────────────
