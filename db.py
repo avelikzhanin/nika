@@ -351,6 +351,30 @@ async def get_recent_meals(user_id: int, days: int = 28):
     )
 
 
+async def get_prev_week_meals(user_id: int):
+    """Meals from 14 to 7 days ago — previous week, used for week-over-week
+    comparison in micro-insight detection."""
+    end = datetime.utcnow() - timedelta(days=7)
+    start = datetime.utcnow() - timedelta(days=14)
+    return await pool.fetch(
+        """SELECT * FROM meal_logs
+           WHERE user_id = $1 AND created_at >= $2 AND created_at < $3
+           ORDER BY created_at""",
+        user_id, start, end,
+    )
+
+
+async def get_prev_week_sos(user_id: int):
+    end = datetime.utcnow() - timedelta(days=7)
+    start = datetime.utcnow() - timedelta(days=14)
+    return await pool.fetch(
+        """SELECT * FROM sos_sessions
+           WHERE user_id = $1 AND created_at >= $2 AND created_at < $3
+           ORDER BY created_at""",
+        user_id, start, end,
+    )
+
+
 async def get_last_meal_log_at(user_id: int):
     row = await pool.fetchrow(
         "SELECT MAX(created_at) AS ts FROM meal_logs WHERE user_id = $1",
