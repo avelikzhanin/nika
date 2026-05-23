@@ -88,7 +88,13 @@ class MealLog(StatesGroup):
     photo_confirm = State()
     trigger = State()       # Q1: why did you eat?
     after_state = State()   # Q2: how do you feel now? (emotional triggers only)
-    chatting = State()      # continuation dialog after the first GPT reply
+
+
+class Chat(StatesGroup):
+    """Generic open-chat state. Entered after any GPT-driven reply
+    (meal log, evening reflection, day recap). Lets the user keep
+    talking naturally for a short window. TTL = CHAT_TTL."""
+    active = State()
 
 
 class SOSDialog(StatesGroup):
@@ -864,75 +870,92 @@ async def _finalize_meal_log(
     await db.touch_last_active(user["id"])
     asyncio.create_task(gpt.persist_facts(user["id"], combined))
 
-    # Stay in continuation mode so the user can reply to Ника's message
-    # (e.g. when Ника asks "как себя чувствуешь?"). The user can break out
-    # any time by pressing main menu buttons — those handlers take priority.
-    # The state auto-expires via TTL check in meal_chatting handler.
-    await state.update_data(
-        meal_conversation=[
+    # Enter generic open-chat state so the user can keep talking.
+    # See Chat.active for behavior; TTL is CHAT_TTL.
+    await _enter_chat(
+        state, user_id=user["id"],
+        seed=[
             {"role": "user", "content": combined},
             {"role": "assistant", "content": response},
         ],
-        meal_chat_last_at=datetime.utcnow().isoformat(),
     )
-    await state.set_state(MealLog.chatting)
     await message.answer(response, reply_markup=kb_main_menu())
 
 
-# Cap on continuation turns — safety net against endless dialog. The natural
-# closure comes from the prompt (model reads user's signal); this is just
-# a hard backstop.
-MEAL_CHAT_MAX_TURNS = 8
+# Open-chat state (Chat.active) — generic continuation buffer after any
+# GPT-driven reply. Lets the user keep talking naturally instead of being
+# kicked back to "use the buttons" the moment a specific flow ends.
 
-# TTL on the chatting state. If the user goes silent for this long, the next
-# message they send is treated as fresh input (routed through fallback),
-# not as a continuation of the old meal dialog.
-MEAL_CHAT_TTL = timedelta(minutes=30)
+# Hard safety cap against runaway loops. Natural closure comes from the
+# user falling silent (TTL) or pressing a main-menu button — this cap is
+# only a backstop for pathological cases.
+CHAT_MAX_TURNS = 50
+
+# If the user goes silent for this long, the next message they send is
+# treated as fresh input (routed through fallback) rather than as a
+# continuation of the old chat.
+CHAT_TTL = timedelta(minutes=15)
 
 
-def _is_meal_chat_stale(data: dict) -> bool:
-    iso = data.get("meal_chat_last_at")
+def _is_chat_stale(data: dict) -> bool:
+    iso = data.get("chat_last_at")
     if not iso:
         return False
     try:
         last = datetime.fromisoformat(iso)
     except ValueError:
         return True
-    return datetime.utcnow() - last > MEAL_CHAT_TTL
+    return datetime.utcnow() - last > CHAT_TTL
 
 
-@router.message(MealLog.chatting, ~F.text)
-async def meal_chatting_non_text(message: Message):
-    """Photo/sticker/voice/etc while in continuation — gentle reminder."""
+async def _enter_chat(state: FSMContext, *, user_id: int, seed: list[dict]):
+    """Enter the generic open-chat state. Seeds the conversation with the
+    given history, refreshes TTL, and clears any pending-reply flags so they
+    don't fight with the chat — the user is clearly engaged here."""
+    # We're taking responsibility for the conversation now. Any in-flight
+    # evening prompt or meal-reminder prompt is superseded by the chat.
+    await db.set_evening_pending(user_id, False)
+    await db.set_meal_reminder_pending(user_id, None)
+    await state.update_data(
+        chat_conversation=seed,
+        chat_last_at=datetime.utcnow().isoformat(),
+    )
+    await state.set_state(Chat.active)
+
+
+@router.message(Chat.active, ~F.text)
+async def chat_active_non_text(message: Message):
+    """Photo/sticker/voice/etc while in chat — gentle reminder."""
     await message.answer(
         "В этом моменте проще ответить текстом. Или жми кнопки ниже 👇",
         reply_markup=kb_main_menu(),
     )
 
 
-@router.message(MealLog.chatting, F.text)
-async def meal_chatting(message: Message, state: FSMContext):
-    """Free-text continuation of the meal dialog. Stays alive until:
+@router.message(Chat.active, F.text)
+async def chat_active(message: Message, state: FSMContext):
+    """Generic open-chat continuation. Stays alive until:
        1. User presses a main-menu button (those handlers clear state first).
-       2. MEAL_CHAT_TTL passes without activity → state cleared, message routes
-          through fallback (which handles long-silence return and evening replies).
-       3. A scheduled evening reflection was sent while the user was idle →
-          we yield to the evening flow.
-       4. MEAL_CHAT_MAX_TURNS is reached (safety net)."""
+       2. CHAT_TTL passes without activity → state cleared, message routes
+          through fallback.
+       3. A FRESH scheduled message arrives (evening reflection or meal
+          reminder) — those handlers set pending flags. We bail so the user's
+          reply goes to the right place. (Pending flags were cleared at chat
+          entry, so any flag we see now is genuinely fresh.)
+       4. CHAT_MAX_TURNS is reached (safety net).
+       5. Safety classifier fires."""
     data = await state.get_data()
     user = await db.get_user(message.from_user.id)
 
-    # Stale state OR a scheduled message arrived while user was idle —
-    # this text is no longer a meal-continuation, hand off to fallback.
     pending_external = user and (
         user["evening_pending"] or user["meal_reminder_pending"]
     )
-    if _is_meal_chat_stale(data) or pending_external:
+    if _is_chat_stale(data) or pending_external:
         await state.clear()
         await fallback(message, state)
         return
 
-    conversation: list[dict] = data.get("meal_conversation", [])
+    conversation: list[dict] = data.get("chat_conversation", [])
     user_text = message.text or ""
 
     red_flag = await gpt.safety_check(user_text)
@@ -947,7 +970,7 @@ async def meal_chatting(message: Message, state: FSMContext):
     conversation.append({"role": "user", "content": user_text})
 
     user_turns = sum(1 for m in conversation if m["role"] == "user")
-    if user_turns > MEAL_CHAT_MAX_TURNS:
+    if user_turns > CHAT_MAX_TURNS:
         await message.answer("Я рядом 🤍", reply_markup=kb_main_menu())
         await state.clear()
         return
@@ -958,10 +981,10 @@ async def meal_chatting(message: Message, state: FSMContext):
     response = await gpt.meal_continuation_response(user, today, week, conversation)
     conversation.append({"role": "assistant", "content": response})
 
-    # Refresh TTL each round of live conversation.
+    # Refresh TTL each round.
     await state.update_data(
-        meal_conversation=conversation,
-        meal_chat_last_at=datetime.utcnow().isoformat(),
+        chat_conversation=conversation,
+        chat_last_at=datetime.utcnow().isoformat(),
     )
     await db.touch_last_active(user["id"])
     asyncio.create_task(gpt.persist_facts(user["id"], user_text))
@@ -1608,16 +1631,26 @@ async def fallback(message: Message, state: FSMContext):
             today = await db.get_today_meals(user["id"], tz)
             week = await db.get_week_meals(user["id"])
             response = await gpt.day_recap_response(user, today, week, user_text)
+            seed_user_msg = f"[ВЕЧЕРНИЙ ОБЗОР ДНЯ] {user_text}"
         else:
             today = await db.get_today_meals(user["id"], tz)
             week = await db.get_week_meals(user["id"])
             response = await gpt.evening_reflection_reply(user, today, week, user_text)
+            seed_user_msg = f"[ВЕЧЕРНЯЯ РЕФЛЕКСИЯ] {user_text}"
 
         await db.save_evening_log(user["id"], user_text, response)
         await db.set_evening_pending(user["id"], False)
         await db.touch_last_active(user["id"])
         asyncio.create_task(gpt.persist_facts(user["id"], user_text))
         await message.answer(response, reply_markup=kb_main_menu())
+        # Enter open-chat state so the user can keep talking.
+        await _enter_chat(
+            state, user_id=user["id"],
+            seed=[
+                {"role": "user", "content": seed_user_msg},
+                {"role": "assistant", "content": response},
+            ],
+        )
         return
 
     await db.touch_last_active(user["id"])
