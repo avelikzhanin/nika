@@ -29,6 +29,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -923,6 +924,14 @@ async def _enter_chat(state: FSMContext, *, user_id: int, seed: list[dict]):
     await state.set_state(Chat.active)
 
 
+def _fsm_for_user(user_id: int) -> FSMContext:
+    """Build an FSMContext for a given user from outside a handler — used by
+    scheduled jobs (micro-insight, evening reflection) that need to set
+    Chat.active so the user can keep talking to a proactive Ника message."""
+    key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+    return FSMContext(storage=dp.storage, key=key)
+
+
 @router.message(Chat.active, ~F.text)
 async def chat_active_non_text(message: Message):
     """Photo/sticker/voice/etc while in chat — gentle reminder."""
@@ -1144,7 +1153,11 @@ async def send_weekly_report(user_id: int):
 
 
 async def check_micro_insight(user_id: int):
-    """Daily check: detect local signals, optionally send a micro-insight."""
+    """Daily check for micro-insight. Primary path is GPT-driven detection
+    over a 14-day window split into previous/current week (lets it spot
+    week-over-week shifts). Hard-coded `_detect_local_signal` stays as a
+    fallback in case the GPT call fails or returns nothing — it catches
+    the most obvious patterns we don't want to miss."""
     try:
         user = await db.get_user(user_id)
         if not user or not user["onboarding_done"]:
@@ -1153,19 +1166,61 @@ async def check_micro_insight(user_id: int):
         last_at = await db.get_last_micro_insight_at(user_id)
         if last_at and (datetime.utcnow() - last_at.replace(tzinfo=None)) < timedelta(days=2):
             return
+
+        # 14-day split data
         week = await db.get_week_meals(user_id)
+        prev_week = await db.get_prev_week_meals(user_id)
         week_sos = await db.get_week_sos(user_id)
-        tz = user["timezone"] or "Europe/Moscow"
-        signal = _detect_local_signal(week, week_sos, tz)
-        if not signal:
-            return
-        insight = await gpt.micro_insight(user, signal, week_meals=week)
+        prev_week_sos = await db.get_prev_week_sos(user_id)
+
+        # Primary: GPT-driven detection (catches patterns we never hardcoded —
+        # sugar, monotony, late coffee, weekly cycles, etc.)
+        insight = await gpt.detect_and_generate_micro_insight(
+            user, week, prev_week, week_sos, prev_week_sos,
+        )
+        signal_source = "gpt-detector"
+
+        # Fallback: hardcoded signal detector. Runs only if GPT returned None
+        # or failed. Keeps a safety net so obvious patterns aren't missed.
+        if not insight:
+            tz = user["timezone"] or "Europe/Moscow"
+            signal = _detect_local_signal(week, week_sos, tz)
+            if signal:
+                insight = await gpt.micro_insight(user, signal, week_meals=week)
+                signal_source = f"hardcoded:{signal}"
+
         if not insight or not insight.strip():
             return
-        await db.save_micro_insight(user_id, insight, signal)
+
+        await db.save_micro_insight(user_id, insight, signal_source)
         await bot.send_message(user_id, insight)
+        # Open Chat.active so the user can reply ("расскажи", "что делать?")
+        # and get a real conversation, not "use the buttons".
+        state = _fsm_for_user(user_id)
+        await _enter_chat(
+            state, user_id=user_id,
+            seed=[{"role": "assistant", "content": insight}],
+        )
     except Exception as e:
         logger.error(f"check_micro_insight error for {user_id}: {e}")
+
+
+# Keywords in meal_text that strongly suggest heaviness/overeating, used as
+# a fallback when after_state wasn't captured (e.g. trigger was hunger).
+_HEAVINESS_KEYWORDS = [
+    "тяжесть", "тяжело", "переел", "перее́л", "переели", "перебор",
+    "слишком много", "слишком плотн", "объелась", "объелся",
+    "вздутие", "распирает",
+]
+
+
+def _has_heaviness_signal(meal) -> bool:
+    """True if a meal record indicates heaviness — either via structured
+    after_state column, or via heaviness keywords in the meal description."""
+    if meal.get("after_state") in ("heavy", "no_help"):
+        return True
+    text = (meal.get("meal_text") or "").lower()
+    return any(kw in text for kw in _HEAVINESS_KEYWORDS)
 
 
 def _detect_local_signal(
@@ -1191,11 +1246,23 @@ def _detect_local_signal(
             {"meal": m, "local_hour": local.hour}
         )
 
-    # "Skipped morning" — a day where the user's first logged meal in local
-    # time is after 14:00. Trust meal_slot if it explicitly marks the meal
-    # as breakfast/lunch/snack — those count as "morning food regardless of
-    # when the entry was made" (e.g. user logged at 12:00 saying "yogurt
-    # at 9").
+    # ──────────────────────────────────────────────
+    # Signal: heaviness after evening meals (multi-day pattern)
+    # Count distinct days where any meal had a heaviness signal.
+    # We check this FIRST because it's the most actionable cross-day pattern.
+    # ──────────────────────────────────────────────
+    heavy_days = sum(
+        1 for entries in by_day.values()
+        if any(_has_heaviness_signal(e["meal"]) for e in entries)
+    )
+    if heavy_days >= 3:
+        return (
+            f"тяжесть после еды повторяется — {heavy_days} дней за неделю"
+        )
+
+    # ──────────────────────────────────────────────
+    # Signal: "skipped morning" — first meal of the day after 14:00 local
+    # ──────────────────────────────────────────────
     skipped_morning_days = 0
     for entries in by_day.values():
         entries.sort(key=lambda e: e["local_hour"])
@@ -1206,7 +1273,6 @@ def _detect_local_signal(
         )
         if has_morning_tag:
             continue
-        # Otherwise look at the local hour of the earliest meal
         if entries[0]["local_hour"] < 14:
             continue
         skipped_morning_days += 1
@@ -1217,7 +1283,9 @@ def _detect_local_signal(
             f"({skipped_morning_days} дней за неделю)"
         )
 
-    # Late dinners (after 22:00 in local time)
+    # ──────────────────────────────────────────────
+    # Signal: late dinners (after 22:00 in local time)
+    # ──────────────────────────────────────────────
     late = sum(
         1 for m in week_meals
         if m["created_at"].astimezone(tz).hour >= 22
@@ -1225,7 +1293,9 @@ def _detect_local_signal(
     if late >= 3:
         return f"поздние ужины (после 22:00) — {late} раз за неделю"
 
-    # Frequent SOS
+    # ──────────────────────────────────────────────
+    # Signal: frequent SOS
+    # ──────────────────────────────────────────────
     if len(week_sos) >= 3:
         return f"SOS пришёл {len(week_sos)} раз за неделю"
 
